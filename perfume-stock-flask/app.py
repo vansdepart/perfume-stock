@@ -1,13 +1,13 @@
+import os
 from flask import Flask, render_template, request, redirect
 from datetime import datetime
 from pymongo import MongoClient
-from config import MONGO_URI, DB_NAME
 
 app = Flask(__name__)
 
 # Koneksi MongoDB
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+client = MongoClient(os.environ.get('MONGO_URI'))
+db = client[os.environ.get('DB_NAME', 'perfume_stock')]
 
 # Collections
 perfumes_collection = db.perfumes
@@ -75,27 +75,16 @@ def add_sale():
         notes = request.form['notes']
         payment_method = request.form['payment_method']
         
-        perfume = perfumes_collection.find_one({'id': perfume_id})
+        selected_perfume = next((p for p in perfumes if p['id'] == perfume_id), None)
         
-        if perfume:
-            total_amount = perfume['price'] * quantity
+        if selected_perfume:
+            total_amount = selected_perfume['price'] * quantity
             
-            # Generate new sale ID
-            last_sale = sales_collection.find_one(sort=[('id', -1)])
-            last_paylater = paylater_sales_collection.find_one(sort=[('id', -1)])
-            new_id = 1
-            if last_sale and last_paylater:
-                new_id = max(last_sale['id'], last_paylater['id']) + 1
-            elif last_sale:
-                new_id = last_sale['id'] + 1
-            elif last_paylater:
-                new_id = last_paylater['id'] + 1
-
             sale_data = {
-                'id': new_id,
-                'perfume_name': perfume['name'],
+                'id': len(sales) + len(paylater_sales) + 1,
+                'perfume_name': selected_perfume['name'],
                 'quantity': quantity,
-                'price_per_item': perfume['price'],
+                'price_per_item': selected_perfume['price'],
                 'total_amount': total_amount,
                 'customer_name': customer_name,
                 'notes': notes,
@@ -109,21 +98,20 @@ def add_sale():
             else:
                 sales_collection.insert_one(sale_data)
                 finance_data = {
-                    'id': new_id,
-                    'description': f"Penjualan {perfume['name']} ({quantity} pcs) - {customer_name}",
+                    'id': len(finances) + 1,
+                    'description': f"Penjualan {selected_perfume['name']} ({quantity} pcs) - {customer_name}",
                     'type': 'income',
                     'amount': total_amount,
                     'payment_method': payment_method,
                     'notes': notes,
-                    'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'is_active': True
+                    'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 finances_collection.insert_one(finance_data)
             
-            # Update stock
+            selected_perfume['stock'] -= quantity
             perfumes_collection.update_one(
-                {'id': perfume_id},
-                {'$inc': {'stock': -quantity}}
+                {'id': selected_perfume['id']},
+                {'$set': {'stock': selected_perfume['stock']}}
             )
             
             return redirect('/sales')
@@ -181,9 +169,12 @@ def delete_sale(id):
     sale = sales_collection.find_one({'id': id})
     if sale:
         sales_collection.delete_one({'id': id})
+        
+        # Hapus data keuangan terkait
         finances_collection.delete_one({
             'description': {'$regex': f"Penjualan.*{sale['perfume_name']}.*{sale['customer_name']}"}
         })
+    
     return redirect('/sales')
 
 @app.route('/paylater')
@@ -203,14 +194,13 @@ def update_paylater(id):
         paylater_sales_collection.delete_one({'id': id})
         
         finance_data = {
-            'id': sale['id'],
+            'id': len(list(finances_collection.find())) + 1,
             'description': f"Pembayaran Paylater - {sale['perfume_name']} - {sale['customer_name']}",
             'type': 'income',
             'amount': sale['total_amount'],
             'payment_method': payment_method,
             'notes': sale['notes'],
-            'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'is_active': True
+            'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         finances_collection.insert_one(finance_data)
     
@@ -218,7 +208,7 @@ def update_paylater(id):
 
 @app.route('/finance')
 def finance():
-    finances = list(finances_collection.find({'is_active': True}))
+    finances = list(finances_collection.find())
     total_income = sum(f['amount'] for f in finances if f['type'] == 'income')
     expenses = sum(f['amount'] for f in finances if f['type'] == 'expense')
     
@@ -229,10 +219,12 @@ def finance():
 
 @app.route('/toggle_finance/<int:id>')
 def toggle_finance(id):
-    finances_collection.update_one(
-        {'id': id},
-        {'$set': {'is_active': False}}
-    )
+    finance = finances_collection.find_one({'id': id})
+    if finance:
+        finances_collection.update_one(
+            {'id': id},
+            {'$set': {'is_active': not finance.get('is_active', True)}}
+        )
     return redirect('/finance')
 
 @app.route('/edit_finance/<int:id>', methods=['POST'])
@@ -262,4 +254,5 @@ def dashboard():
                          total_sales=total_sales)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
